@@ -46,15 +46,22 @@ type Consumer struct {
 	ProducerIDs []string  `json:"producerIds"` // IDs of producers owned by this consumer
 }
 
+// MarketStatistics represents various statistics about the market
+type MarketStatistics struct {
+	TradeCount int     `json:"tradeCount"` // Total number of trades
+	Volume24h  float64 `json:"volume24h"`  // Total trading volume in the last 24 hours
+}
+
 // MarketState represents the current state of the energy market
 type MarketState struct {
-	Producers       []Producer `json:"producers"`
-	Consumers       []Consumer `json:"consumers"`
-	TotalGeneration float64    `json:"totalGeneration"`
-	TotalDemand     float64    `json:"totalDemand"`
-	SocialWelfare   float64    `json:"socialWelfare"`
-	IterationCount  int        `json:"iterationCount"`
-	Converged       bool       `json:"converged"`
+	Producers       []Producer        `json:"producers"`
+	Consumers       []Consumer        `json:"consumers"`
+	TotalGeneration float64           `json:"totalGeneration"`
+	TotalDemand     float64           `json:"totalDemand"`
+	SocialWelfare   float64           `json:"socialWelfare"`
+	IterationCount  int               `json:"iterationCount"`
+	Converged       bool              `json:"converged"`
+	Statistics      MarketStatistics  `json:"statistics"`
 }
 
 // Order represents an energy buy or sell order
@@ -110,6 +117,7 @@ func (s *EnergyMarket) InitMarket(ctx contractapi.TransactionContextInterface) e
 		Consumers:      consumers,
 		IterationCount: 0,
 		Converged:      false,
+		Statistics:     MarketStatistics{TradeCount: 0, Volume24h: 0},
 	}
 
 	marketStateJSON, err := json.Marshal(marketState)
@@ -503,7 +511,7 @@ func (s *EnergyMarket) recordTrade(ctx contractapi.TransactionContextInterface, 
 	if err != nil {
 		return fmt.Errorf("failed to marshal market state: %v", err)
 	}
-	err = ctx.GetStub().PutState("marketState", marketStateJSON)
+	err = ctx.GetStub().PutState("MarketState", marketStateJSON)
 	if err != nil {
 		return fmt.Errorf("failed to update market state: %v", err)
 	}
@@ -780,9 +788,8 @@ func (s *EnergyMarket) GetMarketStatistics(ctx contractapi.TransactionContextInt
 		return nil, err
 	}
 
-	// Calculate total volume in the last 24 hours
+	// Calculate trade count in the last 24 hours
 	oneDayAgo := time.Now().Add(-24 * time.Hour)
-	var volume24h float64
 	var tradeCount24h int
 
 	for _, trade := range trades {
@@ -791,7 +798,6 @@ func (s *EnergyMarket) GetMarketStatistics(ctx contractapi.TransactionContextInt
 			continue
 		}
 		if tradeTime.After(oneDayAgo) {
-			volume24h += trade.TotalValue
 			tradeCount24h++
 		}
 	}
@@ -837,7 +843,7 @@ func (s *EnergyMarket) GetMarketStatistics(ctx contractapi.TransactionContextInt
 		"totalGenerationCapacity": marketState.TotalGeneration,
 		"totalDemand":             marketState.TotalDemand,
 		"socialWelfare":           marketState.SocialWelfare,
-		"volume24h":               volume24h,
+		"volume24h":               marketState.Statistics.Volume24h,
 		"tradeCount24h":           tradeCount24h,
 		"averagePrice24h":         avgPrice24h,
 		"currentPrice":            priceInfo["currentPrice"],
