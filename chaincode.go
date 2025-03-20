@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -28,6 +27,7 @@ type Producer struct {
 	Lambda        float64 `json:"lambda"`        // Current price/marginal cost
 	Cost          float64 `json:"cost"`          // Total production cost
 	OwnerID       string  `json:"ownerId"`       // ID of the consumer who owns this producer
+	TradedVolume  float64 `json:"tradedVolume"`  // Total volume traded by this producer
 }
 
 // Consumer represents an energy consumer
@@ -69,15 +69,14 @@ type Order struct {
 
 // Trade represents a completed energy trade
 type Trade struct {
-	BuyerID       string  `json:"buyerId"`
-	SellerID      string  `json:"sellerId"`
-	ProducerID    string  `json:"producerId"`    // The producer whose energy was traded
-	Price         float64 `json:"price"`         // Price per unit of energy
-	Quantity      float64 `json:"quantity"`      // Quantity of energy traded
-	TotalValue    float64 `json:"totalValue"`    // Total value of the trade (price * quantity)
-	Timestamp     string  `json:"timestamp"`     // When the trade was completed
-	BlockHeight   uint64  `json:"blockHeight"`   // Block height when the trade was recorded
-	TransactionID string  `json:"transactionId"` // Transaction ID for the trade
+	ID         string  `json:"id"`
+	BuyerID    string  `json:"buyerId"`
+	SellerID   string  `json:"sellerId"`
+	ProducerID string  `json:"producerId"`    // The producer whose energy was traded
+	Price      float64 `json:"price"`         // Price per unit of energy
+	Quantity   float64 `json:"quantity"`      // Quantity of energy traded
+	TotalValue float64 `json:"totalValue"`    // Total value of the trade (price * quantity)
+	Timestamp  string  `json:"timestamp"`     // When the trade was completed
 }
 
 // InitMarket initializes the energy market with producers and consumers
@@ -459,222 +458,27 @@ func (s *EnergyMarket) recordOptimizedTrades(ctx contractapi.TransactionContextI
 	}
 	return nil
 }
-func (s *EnergyMarket) PlaceOrder(ctx contractapi.TransactionContextInterface, orderType string, price float64, quantity float64, userID string, producerID string) error {
-	// Validate inputs
-	if orderType != "buy" && orderType != "sell" {
-		return fmt.Errorf("order type must be either 'buy' or 'sell'")
-	}
-	if price <= 0 {
-		return fmt.Errorf("price must be positive")
-	}
-	if quantity <= 0 {
-		return fmt.Errorf("quantity must be positive")
-	}
 
-	// Get market state
-	marketState, err := s.GetMarketState(ctx)
-	if err != nil {
-		return err
-	}
-
-	// Validate user ID exists
-	var userExists bool
-	for _, consumer := range marketState.Consumers {
-		if consumer.ID == userID {
-			userExists = true
-			break
-		}
-	}
-	if !userExists {
-		return fmt.Errorf("user %s does not exist", userID)
-	}
-
-	// For sell orders, validate producer ID and ownership
-	if orderType == "sell" {
-		if producerID == "" {
-			return fmt.Errorf("producer ID is required for sell orders")
-		}
-		var producerExists, ownershipValid bool
-		for _, producer := range marketState.Producers {
-			if producer.ID == producerID {
-				producerExists = true
-				// Additionally, you could check that the order price is not too far from the simulation’s lambda:
-				if math.Abs(price-producer.Lambda) > 0.1*producer.Lambda {
-					return fmt.Errorf("order price %.2f deviates significantly from producer's market price %.2f", price, producer.Lambda)
-				}
-				if producer.OwnerID == userID {
-					ownershipValid = true
-				}
-				break
-			}
-		}
-		if !producerExists {
-			return fmt.Errorf("producer %s does not exist", producerID)
-		}
-		if !ownershipValid {
-			return fmt.Errorf("user %s does not own producer %s", userID, producerID)
-		}
-	}
-
-	// Create the order
-	order := Order{
-		UserID:     userID,
-		Price:      price,
-		Quantity:   quantity,
-		OrderType:  orderType,
-		Timestamp:  time.Now().Format(time.RFC3339),
-		ProducerID: producerID,
-	}
-
-	// Generate a unique key for the order
-	key := fmt.Sprintf("ORDER_%s_%s_%s_%s", orderType, strconv.FormatFloat(price, 'f', 2, 64), userID, time.Now().Format("20060102150405"))
-
-	// Store the order in the ledger
-	orderJSON, err := json.Marshal(order)
-	if err != nil {
-		return fmt.Errorf("failed to marshal order: %v", err)
-	}
-	err = ctx.GetStub().PutState(key, orderJSON)
-	if err != nil {
-		return fmt.Errorf("failed to place order: %v", err)
-	}
-
-	// Immediately try to match orders
-	return s.MatchOrders(ctx)
-}
-
-// MatchOrders matches buy and sell orders and calls recordTrade to update both the ledger and market state.
-func (s *EnergyMarket) MatchOrders(ctx contractapi.TransactionContextInterface) error {
-	orderIterator, err := ctx.GetStub().GetStateByRange("ORDER_", "ORDER_~")
-	if err != nil {
-		return fmt.Errorf("failed to get orders: %v", err)
-	}
-	defer orderIterator.Close()
-
-	var buyOrders, sellOrders []struct {
-		Order Order
-		Key   string
-	}
-
-	// Collect all orders
-	for orderIterator.HasNext() {
-		queryResponse, err := orderIterator.Next()
-		if err != nil {
-			continue
-		}
-		var order Order
-		err = json.Unmarshal(queryResponse.Value, &order)
-		if err != nil {
-			continue
-		}
-		orderWithKey := struct {
-			Order Order
-			Key   string
-		}{order, queryResponse.Key}
-
-		if order.OrderType == "buy" {
-			buyOrders = append(buyOrders, orderWithKey)
-		} else if order.OrderType == "sell" {
-			sellOrders = append(sellOrders, orderWithKey)
-		}
-	}
-
-	// Sort buy orders (highest price first) and sell orders (lowest price first)
-	sort.Slice(buyOrders, func(i, j int) bool { return buyOrders[i].Order.Price > buyOrders[j].Order.Price })
-	sort.Slice(sellOrders, func(i, j int) bool { return sellOrders[i].Order.Price < sellOrders[j].Order.Price })
-
-	// Process matching
-	for len(buyOrders) > 0 && len(sellOrders) > 0 {
-		buy := buyOrders[0]
-		sell := sellOrders[0]
-
-		// If the highest buy price is lower than the lowest sell price, no match is possible
-		if buy.Order.Price < sell.Order.Price {
-			break
-		}
-
-		// Trade quantity is the minimum of the two orders
-		tradeQty := math.Min(buy.Order.Quantity, sell.Order.Quantity)
-		// Use the midpoint price for fairness
-		tradePrice := (buy.Order.Price + sell.Order.Price) / 2
-
-		// Record the trade; note that recordTrade updates both the ledger and market state
-		err := s.recordTrade(ctx, buy.Order.UserID, sell.Order.UserID, sell.Order.ProducerID, tradePrice, tradeQty)
-		if err != nil {
-			return fmt.Errorf("failed to record trade: %v", err)
-		}
-
-		// Update order quantities
-		buy.Order.Quantity -= tradeQty
-		sell.Order.Quantity -= tradeQty
-
-		// Remove or update orders accordingly
-		if buy.Order.Quantity <= 0 {
-			err := ctx.GetStub().DelState(buy.Key)
-			if err != nil {
-				return fmt.Errorf("failed to delete buy order: %v", err)
-			}
-			buyOrders = buyOrders[1:]
-		} else {
-			buyJSON, _ := json.Marshal(buy.Order)
-			err := ctx.GetStub().PutState(buy.Key, buyJSON)
-			if err != nil {
-				return fmt.Errorf("failed to update buy order: %v", err)
-			}
-		}
-		if sell.Order.Quantity <= 0 {
-			err := ctx.GetStub().DelState(sell.Key)
-			if err != nil {
-				return fmt.Errorf("failed to delete sell order: %v", err)
-			}
-			sellOrders = sellOrders[1:]
-		} else {
-			sellJSON, _ := json.Marshal(sell.Order)
-			err := ctx.GetStub().PutState(sell.Key, sellJSON)
-			if err != nil {
-				return fmt.Errorf("failed to update sell order: %v", err)
-			}
-		}
-	}
-
-	return nil
-}
-
-// recordTrade records a trade, updates consumer balances, and (now) updates the producer's traded volume.
+// recordTrade records a completed trade in the ledger
 func (s *EnergyMarket) recordTrade(ctx contractapi.TransactionContextInterface, buyerID string, sellerID string, producerID string, price float64, quantity float64) error {
 	marketState, err := s.GetMarketState(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get market state: %v", err)
 	}
 
-	var buyerIdx, sellerIdx int
-	var buyerFound, sellerFound bool
-	for i, consumer := range marketState.Consumers {
-		if consumer.ID == buyerID {
-			buyerFound = true
-			buyerIdx = i
-		}
-		if consumer.ID == sellerID {
-			sellerFound = true
-			sellerIdx = i
-		}
-	}
-	if !buyerFound {
-		return fmt.Errorf("buyer %s does not exist", buyerID)
-	}
-	if !sellerFound && sellerID != "MARKET" {
-		return fmt.Errorf("seller %s does not exist", sellerID)
+	// Create trade record with timestamp and trade count
+	trade := Trade{
+		ID:         fmt.Sprintf("TRADE_%d_%s", marketState.Statistics.TradeCount+1, time.Now().Format("20060102150405")),
+		BuyerID:    buyerID,
+		SellerID:   sellerID,
+		ProducerID: producerID,
+		Price:      price,
+		Quantity:   quantity,
+		TotalValue: price * quantity,
+		Timestamp:  time.Now().Format(time.RFC3339),
 	}
 
-	totalValue := price * quantity
-
-	// Update balances in market state
-	marketState.Consumers[buyerIdx].Balance -= totalValue
-	if sellerID != "MARKET" {
-		marketState.Consumers[sellerIdx].Balance += totalValue
-	}
-
-	// Update producer traded volume so that simulation could account for executed trades
+	// Update producer's traded volume
 	for i := range marketState.Producers {
 		if marketState.Producers[i].ID == producerID {
 			marketState.Producers[i].TradedVolume += quantity
@@ -682,44 +486,38 @@ func (s *EnergyMarket) recordTrade(ctx contractapi.TransactionContextInterface, 
 		}
 	}
 
-	// Create trade record
-	blockHeight, err := ctx.GetStub().GetTxHeight()
-	if err != nil {
-		return fmt.Errorf("failed to get block height: %v", err)
-	}
-	txID := ctx.GetStub().GetTxID()
-
-	trade := Trade{
-		BuyerID:       buyerID,
-		SellerID:      sellerID,
-		ProducerID:    producerID,
-		Price:         price,
-		Quantity:      quantity,
-		TotalValue:    totalValue,
-		Timestamp:     time.Now().Format(time.RFC3339),
-		BlockHeight:   blockHeight,
-		TransactionID: txID,
+	// Update consumer's total demand
+	for i := range marketState.Consumers {
+		if marketState.Consumers[i].ID == buyerID {
+			marketState.Consumers[i].TotalDemand += quantity
+			break
+		}
 	}
 
-	tradeKey := fmt.Sprintf("TRADE_%s_%s_%s_%s", time.Now().Format("20060102150405"), buyerID, sellerID, producerID)
-	tradeJSON, err := json.Marshal(trade)
-	if err != nil {
-		return fmt.Errorf("failed to marshal trade: %v", err)
-	}
-	err = ctx.GetStub().PutState(tradeKey, tradeJSON)
-	if err != nil {
-		return fmt.Errorf("failed to store trade: %v", err)
-	}
+	// Update market statistics
+	marketState.Statistics.TradeCount++
+	marketState.Statistics.Volume24h += trade.TotalValue
 
-	// Save updated market state so that subsequent simulation or queries see the latest balances and traded volumes.
+	// Save the updated market state
 	marketStateJSON, err := json.Marshal(marketState)
 	if err != nil {
 		return fmt.Errorf("failed to marshal market state: %v", err)
 	}
-	err = ctx.GetStub().PutState("MarketState", marketStateJSON)
+	err = ctx.GetStub().PutState("marketState", marketStateJSON)
 	if err != nil {
 		return fmt.Errorf("failed to update market state: %v", err)
 	}
+
+	// Save the trade record
+	tradeJSON, err := json.Marshal(trade)
+	if err != nil {
+		return fmt.Errorf("failed to marshal trade: %v", err)
+	}
+	err = ctx.GetStub().PutState(trade.ID, tradeJSON)
+	if err != nil {
+		return fmt.Errorf("failed to save trade: %v", err)
+	}
+
 	return nil
 }
 
@@ -1158,6 +956,7 @@ func (s *EnergyMarket) CreateProducer(ctx contractapi.TransactionContextInterfac
 		Lambda:        2*a*productionMin + b,
 		Cost:          a*math.Pow(productionMin, 2) + b*productionMin,
 		OwnerID:       ownerID,
+		TradedVolume:  0,
 	}
 
 	// Add new producer to market state
